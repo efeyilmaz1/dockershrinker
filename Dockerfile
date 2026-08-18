@@ -38,7 +38,7 @@ COPY . /app
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-RUN pip install pandas numpy scipy matplotlib jupyter
+RUN pip install requests urllib3
 
 EXPOSE 8000
 
