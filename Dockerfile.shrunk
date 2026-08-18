@@ -1,0 +1,37 @@
+# =============================================================================
+# OPTIMIZED MULTI-STAGE DOCKERFILE
+# Uretilen asama: AI Shrinker Bot tarafindan otomatik optimize edildi.
+# =============================================================================
+
+# --- ASAMA 1: BUILDER ---
+# Derleyicilerin ve paketlerin kuruldugu agir katman
+FROM python:3.11 AS builder
+
+WORKDIR /app
+COPY requirements.txt .
+
+# Sadece kullanici dizinine kur ve onbellegi temizle
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# --- ASAMA 2: PRODUCTION (SHRUNK) ---
+# Sadece temiz kodun alindigi hafif katman
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Sadece builder'dan kurulan python paketlerini kopyala
+COPY --from=builder /root/.local /root/.local
+
+# Proje kodlarini kopyala
+COPY . .
+
+# Root olmayan kullanici (Guvenlik)
+RUN useradd -m appuser && chown -R appuser /app
+USER appuser
+
+# Path guncellemesi
+ENV PATH=/root/.local/bin:$PATH
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
