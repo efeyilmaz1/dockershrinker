@@ -18,33 +18,30 @@ def generate_multistage_dockerfile(source_path="Dockerfile", dest_path="Dockerfi
 # =============================================================================
 
 # --- ASAMA 1: BUILDER ---
-# Derleyicilerin ve paketlerin kuruldugu agir katman
 FROM python:3.11 AS builder
 
 WORKDIR /app
-COPY requirements.txt .
+# Sanal ortam (venv) olustur
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Sadece kullanici dizinine kur ve onbellegi temizle
-RUN pip install --user --no-cache-dir -r requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # --- ASAMA 2: PRODUCTION (SHRUNK) ---
-# Sadece temiz kodun alindigi hafif katman
 FROM {info['target_base']}
 
 WORKDIR /app
 
-# Sadece builder'dan kurulan python paketlerini kopyala
-COPY --from=builder /root/.local /root/.local
+# Builder asamasindan sanal ortami (/opt/venv) kopyala
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Proje kodlarini kopyala
 COPY . .
 
 # Root olmayan kullanici (Guvenlik)
 RUN useradd -m appuser && chown -R appuser /app
 USER appuser
-
-# Path guncellemesi
-ENV PATH=/root/.local/bin:$PATH
 
 EXPOSE {info['port']}
 

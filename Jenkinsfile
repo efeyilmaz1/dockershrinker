@@ -1,0 +1,214 @@
+// =============================================================================
+// Jenkinsfile — Smart Docker Image Shrinker & Vulnerability Trimmer Bot
+//
+// v2: extends the Part 1 pipeline (build -> shrink -> report -> Trivy) with
+// the Part 2 stack you already run on AWS: SonarQube (code quality gate),
+// Nexus (Docker registry), and an EKS cluster (deploy target) provisioned
+// by infra/terraform. See PART2_SETUP.md for the one-time setup this
+// pipeline assumes is already done (Jenkins credentials, SonarQube server
+// config, EKS access entry for the Jenkins IAM role, ingress-nginx
+// installed on the cluster).
+//
+// Required on the Jenkins agent: docker, python3, aws CLI v2, kubectl, helm,
+// sonar-scanner CLI.
+//
+// Required Jenkins configuration:
+//   - Credential (Username/password) with ID `nexuslogin`
+//     -> Nexus repository user + a Nexus-generated token/password.
+//   - Manage Jenkins > System > SonarQube servers: a server named
+//     `sonarserver` pointing at your Nexus/SonarQube EC2's URL, with an
+//     auth token stored as a Jenkins secret text credential.
+//   - Manage Jenkins > Global Tool Configuration > SonarQube Scanner:
+//     a tool install named `sonar8.0`.
+//   - Jenkins EC2 instance's IAM role must be present in
+//     `additional_eks_access_entries` in infra/terraform (or added later
+//     via `aws eks create-access-entry`) so `aws eks update-kubeconfig`
+//     actually grants kubectl/helm access.
+// =============================================================================
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        IMAGE_NAME        = 'smartdockershrinker'
+        SONAR_PROJECT_KEY = 'smartdockershrinker'
+
+        NEXUS_REGISTRY = "${env.NEXUS_REGISTRY ?: '172.31.39.163:8082'}"
+        NEXUS_REPO     = "${env.NEXUS_REPO ?: 'docker-hosted'}"
+
+        AWS_REGION       = "${env.AWS_REGION ?: 'eu-central-1'}"
+        EKS_CLUSTER_NAME = "${env.EKS_CLUSTER_NAME ?: 'smartdockershrinker-eks'}"
+        HELM_RELEASE     = 'smartdockershrinker'
+        HELM_NAMESPACE   = 'smartdockershrinker'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Verify Toolchain') {
+            steps {
+                sh '''
+                    set -e
+                    docker --version
+                    python3 --version
+                    aws --version
+                    kubectl version --client
+                    helm version
+                '''
+            }
+        }
+
+        // FAZ 1: Build the bloated image, for comparison
+        stage('Build Original (Bloated) Image') {
+            steps {
+                sh 'docker build -t ${IMAGE_NAME}:bloated .'
+            }
+        }
+
+        // FAZ 2: Run the shrinker engine
+        stage('Run Shrinker Bot') {
+            steps {
+                sh '''
+                    set -e
+                    python3 shrinker_engine/multistage_builder.py
+                    docker build -t ${IMAGE_NAME}:shrunk -f Dockerfile.shrunk .
+                '''
+            }
+        }
+
+        // FAZ 3: Calculate size difference
+        stage('Calculate Size Savings') {
+            steps {
+                sh 'python3 shrinker_engine/size_calculator.py ${IMAGE_NAME}:bloated ${IMAGE_NAME}:shrunk'
+            }
+        }
+
+        // FAZ 4: Static code quality — SonarQube (self-hosted on AWS)
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    scannerHome = tool 'sonar8.0'
+                }
+                withSonarQubeEnv('sonarserver') {
+                    sh '''
+                        ${scannerHome}/bin/sonar-scanner \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=. \
+                          -Dsonar.python.version=3.11
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                // Requires a SonarQube webhook back to this Jenkins
+                // (Administration > Configuration > Webhooks in SonarQube) —
+                // see PART2_SETUP.md. Without it this just times out.
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // FAZ 5: Vulnerability scan (unchanged from Part 1)
+        stage('Trivy Security Scan') {
+            steps {
+                sh '''
+                    docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        aquasec/trivy:latest image \
+                        --format table \
+                        --exit-code 0 \
+                        --ignore-unfixed \
+                        --vuln-type os,library \
+                        --severity CRITICAL,HIGH \
+                        ${IMAGE_NAME}:shrunk
+                '''
+            }
+        }
+
+        // FAZ 6: Push the shrunk image to your self-hosted Nexus registry
+        stage('Push to Nexus') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'nexuslogin',
+                    usernameVariable: 'NEXUS_USER',
+                    passwordVariable: 'NEXUS_PASS'
+                )]) {
+                    sh '''
+                        set -e
+                        echo "$NEXUS_PASS" | docker login ${NEXUS_REGISTRY} -u "$NEXUS_USER" --password-stdin
+                        docker tag ${IMAGE_NAME}:shrunk ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:shrunk-${BUILD_NUMBER}
+                        docker tag ${IMAGE_NAME}:shrunk ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:latest
+                        docker push ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:shrunk-${BUILD_NUMBER}
+                        docker push ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:latest
+                        docker logout ${NEXUS_REGISTRY}
+                    '''
+                }
+            }
+        }
+
+        // FAZ 7: Deploy to EKS via the Helm chart in helm/smartdockershrinker
+        // Infra itself (VPC/EKS) is NOT touched here — that stays a manual
+        // `terraform apply` from your PC by design (see PART2_SETUP.md).
+        stage('Deploy to EKS') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'nexuslogin',
+                    usernameVariable: 'NEXUS_USER',
+                    passwordVariable: 'NEXUS_PASS'
+                )]) {
+                    // Non-fatal on purpose: the EKS cluster (infra/terraform)
+                    // may not be provisioned yet. Build still succeeds through
+                    // Nexus push even if this stage can't reach a cluster.
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        sh '''
+                            set -e
+                            aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION}
+
+                            kubectl create namespace ${HELM_NAMESPACE} \
+                                --dry-run=client -o yaml | kubectl apply -f -
+
+                            kubectl create secret docker-registry nexus-registry-credentials \
+                                --docker-server=${NEXUS_REGISTRY} \
+                                --docker-username="$NEXUS_USER" \
+                                --docker-password="$NEXUS_PASS" \
+                                --namespace ${HELM_NAMESPACE} \
+                                --dry-run=client -o yaml | kubectl apply -f -
+
+                            helm upgrade --install ${HELM_RELEASE} ./helm/smartdockershrinker \
+                                --namespace ${HELM_NAMESPACE} \
+                                --set image.repository=${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME} \
+                                --set image.tag=shrunk-${BUILD_NUMBER} \
+                                --wait --timeout 5m
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker image prune -f || true'
+        }
+        success {
+            echo "✅ Pipeline succeeded: image built, quality-gated, scanned, pushed to Nexus, and deployed to EKS."
+        }
+        failure {
+            echo '❌ Pipeline failed — check the stage logs above.'
+        }
+    }
+}

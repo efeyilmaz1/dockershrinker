@@ -1,0 +1,31 @@
+# Copy this file to terraform.tfvars and fill in your real values.
+# terraform.tfvars is already covered by a *.tfvars ignore rule you should
+# add to .gitignore — never commit real account IDs/CIDRs you consider
+# sensitive, though none of the values below are secrets by themselves.
+
+aws_region   = "eu-central-1"
+project_name = "smartdockershrinker"
+environment  = "dev"
+
+# Narrow this to your Jenkins EC2's Elastic IP and your own PC's IP once
+# you know them, e.g. ["203.0.113.10/32", "198.51.100.7/32"]
+eks_public_access_cidrs = ["0.0.0.0/0"]
+
+node_instance_types = ["t3.medium"]
+node_desired_size   = 2
+node_min_size       = 2
+node_max_size        = 4
+
+# Fill in after you know your Jenkins EC2 instance's IAM role ARN
+# (Manage Jenkins host -> EC2 console -> Instance -> IAM Role).
+additional_eks_access_entries = {
+  jenkins = {
+    principal_arn = "arn:aws:iam::123456789012:role/jenkins-ec2-role"
+    policy_associations = {
+      admin = {
+        policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+        access_scope = { type = "cluster" }
+      }
+    }
+  }
+}

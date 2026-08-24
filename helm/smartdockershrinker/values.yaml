@@ -1,0 +1,47 @@
+replicaCount: 2
+
+image:
+  # Overridden per-deploy by Jenkins with --set, e.g.:
+  #   nexus.example.com:8082/docker-hosted/smartdockershrinker
+  repository: "nexus.example.com:8082/docker-hosted/smartdockershrinker"
+  tag: "shrunk-latest"
+  pullPolicy: IfNotPresent
+
+# Must match the `kubectl create secret docker-registry` name created by
+# the Jenkinsfile's Deploy stage.
+imagePullSecrets:
+  - name: nexus-registry-credentials
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  # Requires the ingress-nginx controller installed once per cluster —
+  # see PART2_SETUP.md. Switch to "alb" only if you've also installed the
+  # AWS Load Balancer Controller with its IRSA IAM role.
+  className: nginx
+  host: shrinker.example.com
+  annotations: {}
+  tls: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+probes:
+  path: /healthz
+  initialDelaySeconds: 5
+  periodSeconds: 10
