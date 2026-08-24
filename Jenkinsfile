@@ -102,11 +102,16 @@ pipeline {
         }
 
         // FAZ 4: Static code quality — SonarQube (self-hosted on AWS)
+        // scannerHome must be resolved via a stage-level `environment {}`
+        // block (matching the working vprofile-ci-pipeline job on this same
+        // Jenkins) - calling `tool 'sonar8.0'` inside `steps { script {} }`
+        // does NOT trigger the Declarative auto-install and returns an empty
+        // path, which broke this stage (`/bin/sonar-scanner: not found`).
         stage('SonarQube Analysis') {
+            environment {
+                scannerHome = tool 'sonar8.0'
+            }
             steps {
-                script {
-                    scannerHome = tool 'sonar8.0'
-                }
                 withSonarQubeEnv('sonarserver') {
                     sh '''
                         ${scannerHome}/bin/sonar-scanner \
