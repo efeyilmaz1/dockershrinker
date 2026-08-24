@@ -58,13 +58,20 @@ pipeline {
 
         stage('Verify Toolchain') {
             steps {
+                // docker/python3/aws are required for every stage below, so
+                // those still fail fast. kubectl/helm are only needed by the
+                // Deploy to EKS stage (which is itself non-fatal until the
+                // cluster exists - see infra/terraform + PART2_SETUP.md), so
+                // their absence is just a warning here, not a build-breaker.
                 sh '''
                     set -e
                     docker --version
                     python3 --version
                     aws --version
-                    kubectl version --client
-                    helm version
+                '''
+                sh '''
+                    kubectl version --client || echo "WARNING: kubectl not found on this agent - Deploy to EKS stage will fail/skip"
+                    helm version || echo "WARNING: helm not found on this agent - Deploy to EKS stage will fail/skip"
                 '''
             }
         }
