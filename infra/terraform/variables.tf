@@ -37,7 +37,7 @@ variable "single_nat_gateway" {
 variable "eks_cluster_version" {
   description = "Kubernetes version for the EKS control plane."
   type        = string
-  default     = "1.30"
+  default     = "1.31"
 }
 
 variable "eks_public_access_cidrs" {

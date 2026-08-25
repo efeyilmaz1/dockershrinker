@@ -42,7 +42,7 @@ pipeline {
         NEXUS_REGISTRY = "${env.NEXUS_REGISTRY ?: '172.31.39.163:8082'}"
         NEXUS_REPO     = "${env.NEXUS_REPO ?: 'docker-hosted'}"
 
-        AWS_REGION       = "${env.AWS_REGION ?: 'eu-central-1'}"
+        AWS_REGION       = "${env.AWS_REGION ?: 'us-east-1'}"
         EKS_CLUSTER_NAME = "${env.EKS_CLUSTER_NAME ?: 'smartdockershrinker-eks'}"
         HELM_RELEASE     = 'smartdockershrinker'
         HELM_NAMESPACE   = 'smartdockershrinker'

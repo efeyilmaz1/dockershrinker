@@ -22,3 +22,11 @@ Thumbs.db
 # Diğer
 *.log
 scratch/
+
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+*.exe
