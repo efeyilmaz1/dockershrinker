@@ -172,42 +172,55 @@ pipeline {
             }
         }
 
-        // FAZ 7: Deploy to EKS via the Helm chart in helm/smartdockershrinker
+        // FAZ 7: Push the same shrunk image to ECR too. The EKS nodes live in
+        // a separate VPC from Nexus (172.31.x.x, no peering) and Nexus talks
+        // plain HTTP, so pulling straight from Nexus would need VPC peering
+        // *and* a containerd insecure-registry config on every node. ECR is
+        // in the same account, reachable over the node's existing NAT egress,
+        // HTTPS, and node roles already get ECR pull rights by default from
+        // the terraform-aws-modules/eks module - no extra plumbing needed.
+        // Nexus push above is unchanged/still the artifact-of-record.
+        stage('Push to ECR') {
+            steps {
+                sh '''
+                    set -e
+                    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                    ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    docker tag ${IMAGE_NAME}:shrunk ${ECR_REGISTRY}/${IMAGE_NAME}:shrunk-${BUILD_NUMBER}
+                    docker push ${ECR_REGISTRY}/${IMAGE_NAME}:shrunk-${BUILD_NUMBER}
+                    echo "${ECR_REGISTRY}" > .ecr_registry
+                '''
+            }
+        }
+
+        // FAZ 8: Deploy to EKS via the Helm chart in helm/smartdockershrinker
         // Infra itself (VPC/EKS) is NOT touched here — that stays a manual
         // `terraform apply` from your PC by design (see PART2_SETUP.md).
         stage('Deploy to EKS') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'nexuslogin',
-                    usernameVariable: 'NEXUS_USER',
-                    passwordVariable: 'NEXUS_PASS'
-                )]) {
-                    // Non-fatal on purpose: the EKS cluster (infra/terraform)
-                    // may not be provisioned yet. Build still succeeds through
-                    // Nexus push even if this stage can't reach a cluster.
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        sh '''
-                            set -e
-                            aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION}
+                // Non-fatal on purpose: the EKS cluster (infra/terraform)
+                // may not be provisioned yet. Build still succeeds through
+                // Nexus push even if this stage can't reach a cluster.
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    sh '''
+                        set -e
+                        ECR_REGISTRY=$(cat .ecr_registry)
+                        aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION}
 
-                            kubectl create namespace ${HELM_NAMESPACE} \
-                                --dry-run=client -o yaml | kubectl apply -f -
+                        kubectl create namespace ${HELM_NAMESPACE} \
+                            --dry-run=client -o yaml | kubectl apply -f -
 
-                            kubectl create secret docker-registry nexus-registry-credentials \
-                                --docker-server=${NEXUS_REGISTRY} \
-                                --docker-username="$NEXUS_USER" \
-                                --docker-password="$NEXUS_PASS" \
-                                --namespace ${HELM_NAMESPACE} \
-                                --dry-run=client -o yaml | kubectl apply -f -
-
-                            helm upgrade --install ${HELM_RELEASE} ./helm/smartdockershrinker \
-                                --namespace ${HELM_NAMESPACE} \
-                                --set image.repository=${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME} \
-                                --set image.tag=shrunk-${BUILD_NUMBER} \
-                                --wait --timeout 5m
-                        '''
-                    }
+                        helm upgrade --install ${HELM_RELEASE} ./helm/smartdockershrinker \
+                            --namespace ${HELM_NAMESPACE} \
+                            --set image.repository=${ECR_REGISTRY}/${IMAGE_NAME} \
+                            --set image.tag=shrunk-${BUILD_NUMBER} \
+                            --set imagePullSecrets=null \
+                            --wait --timeout 5m
+                    '''
                 }
+            }
+        }
             }
         }
     }
