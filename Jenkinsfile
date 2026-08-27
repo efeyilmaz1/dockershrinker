@@ -216,8 +216,10 @@ pipeline {
                             ECR_REGISTRY=$(cat .ecr_registry)
                             KUBECONFIG_FILE="$(pwd)/.k3s-kubeconfig-${BUILD_NUMBER}.yaml"
                             umask 077
+                            set +x  # do not echo the kubeconfig secret to the console log
                             printf '%s' "$K3S_KUBECONFIG_CONTENT" > "$KUBECONFIG_FILE"
                             export KUBECONFIG="$KUBECONFIG_FILE"
+                            set -x
 
                             kubectl create namespace ${HELM_NAMESPACE} \
                                 --dry-run=client -o yaml | kubectl apply -f -
