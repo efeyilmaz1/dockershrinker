@@ -1,13 +1,14 @@
 // =============================================================================
 // Jenkinsfile — Smart Docker Image Shrinker & Vulnerability Trimmer Bot
 //
-// v2: extends the Part 1 pipeline (build -> shrink -> report -> Trivy) with
-// the Part 2 stack you already run on AWS: SonarQube (code quality gate),
-// Nexus (Docker registry), and an EKS cluster (deploy target) provisioned
-// by infra/terraform. See PART2_SETUP.md for the one-time setup this
-// pipeline assumes is already done (Jenkins credentials, SonarQube server
-// config, EKS access entry for the Jenkins IAM role, ingress-nginx
-// installed on the cluster).
+// v3: EKS was decommissioned (cost) and replaced with a self-managed k3s
+// cluster on a plain EC2 instance (smartdockershrinker-k3s), which supports
+// proper Stop/Start. The pipeline still builds -> shrinks -> quality-gates
+// (SonarQube) -> scans (Trivy) -> pushes to Nexus + ECR -> deploys, but the
+// deploy target is now k3s via a kubeconfig Jenkins secret instead of
+// `aws eks update-kubeconfig`. See PART2_SETUP.md for the one-time setup
+// this pipeline assumes is already done (Jenkins credentials, SonarQube
+// server config).
 //
 // Required on the Jenkins agent: docker, python3, aws CLI v2, kubectl, helm,
 // sonar-scanner CLI.
@@ -20,10 +21,17 @@
 //     auth token stored as a Jenkins secret text credential.
 //   - Manage Jenkins > Global Tool Configuration > SonarQube Scanner:
 //     a tool install named `sonar8.0`.
-//   - Jenkins EC2 instance's IAM role must be present in
-//     `additional_eks_access_entries` in infra/terraform (or added later
-//     via `aws eks create-access-entry`) so `aws eks update-kubeconfig`
-//     actually grants kubectl/helm access.
+//   - Credential (Secret text) with ID `k3s-kubeconfig` containing the full
+//     k3s kubeconfig YAML, with the cluster `server:` field rewritten from
+//     127.0.0.1 to the k3s node's public IP (Jenkins lives in a different
+//     VPC with no peering, so it must reach k3s over its public IP on
+//     6443 — that port must be open in the k3s node's security group for
+//     this Jenkins instance's IP).
+//   - The k3s cluster's `smartdockershrinker` namespace's `default`
+//     ServiceAccount must be patched with imagePullSecrets pointing at an
+//     `ecr-registry-secret` (docker-registry secret) that is periodically
+//     refreshed on the k3s host, since plain k3s (unlike EKS) has no
+//     built-in ECR credential helper.
 // =============================================================================
 
 pipeline {
@@ -42,10 +50,9 @@ pipeline {
         NEXUS_REGISTRY = "${env.NEXUS_REGISTRY ?: '172.31.39.163:8082'}"
         NEXUS_REPO     = "${env.NEXUS_REPO ?: 'docker-hosted'}"
 
-        AWS_REGION       = "${env.AWS_REGION ?: 'us-east-1'}"
-        EKS_CLUSTER_NAME = "${env.EKS_CLUSTER_NAME ?: 'smartdockershrinker-eks'}"
-        HELM_RELEASE     = 'smartdockershrinker'
-        HELM_NAMESPACE   = 'smartdockershrinker'
+        AWS_REGION     = "${env.AWS_REGION ?: 'us-east-1'}"
+        HELM_RELEASE   = 'smartdockershrinker'
+        HELM_NAMESPACE = 'smartdockershrinker'
     }
 
     stages {
@@ -60,9 +67,9 @@ pipeline {
             steps {
                 // docker/python3/aws are required for every stage below, so
                 // those still fail fast. kubectl/helm are only needed by the
-                // Deploy to EKS stage (which is itself non-fatal until the
-                // cluster exists - see infra/terraform + PART2_SETUP.md), so
-                // their absence is just a warning here, not a build-breaker.
+                // Deploy to k3s stage (which is itself non-fatal if the
+                // cluster can't be reached), so their absence is just a
+                // warning here, not a build-breaker.
                 sh '''
                     set -e
                     docker --version
@@ -70,8 +77,8 @@ pipeline {
                     aws --version
                 '''
                 sh '''
-                    kubectl version --client || echo "WARNING: kubectl not found on this agent - Deploy to EKS stage will fail/skip"
-                    helm version || echo "WARNING: helm not found on this agent - Deploy to EKS stage will fail/skip"
+                    kubectl version --client || echo "WARNING: kubectl not found on this agent - Deploy to k3s stage will fail/skip"
+                    helm version || echo "WARNING: helm not found on this agent - Deploy to k3s stage will fail/skip"
                 '''
             }
         }
@@ -172,14 +179,10 @@ pipeline {
             }
         }
 
-        // FAZ 7: Push the same shrunk image to ECR too. The EKS nodes live in
-        // a separate VPC from Nexus (172.31.x.x, no peering) and Nexus talks
-        // plain HTTP, so pulling straight from Nexus would need VPC peering
-        // *and* a containerd insecure-registry config on every node. ECR is
-        // in the same account, reachable over the node's existing NAT egress,
-        // HTTPS, and node roles already get ECR pull rights by default from
-        // the terraform-aws-modules/eks module - no extra plumbing needed.
-        // Nexus push above is unchanged/still the artifact-of-record.
+        // FAZ 7: Push the same shrunk image to ECR too. The k3s node pulls
+        // from ECR over HTTPS using its own IAM instance role (no extra
+        // plumbing needed) - Nexus push above is unchanged/still the
+        // artifact-of-record.
         stage('Push to ECR') {
             steps {
                 sh '''
@@ -194,30 +197,42 @@ pipeline {
             }
         }
 
-        // FAZ 8: Deploy to EKS via the Helm chart in helm/smartdockershrinker
-        // Infra itself (VPC/EKS) is NOT touched here — that stays a manual
-        // `terraform apply` from your PC by design (see PART2_SETUP.md).
-        stage('Deploy to EKS') {
+        // FAZ 8: Deploy to the self-managed k3s cluster (replaces EKS) via
+        // the Helm chart in helm/smartdockershrinker. The k3s node's
+        // `smartdockershrinker` namespace default ServiceAccount already
+        // has imagePullSecrets pointing at a periodically-refreshed
+        // `ecr-registry-secret`, so `imagePullSecrets=null` here just means
+        // "don't set it explicitly in the pod spec" (same technique used on
+        // EKS, where the node role's built-in ECR helper made it a no-op).
+        stage('Deploy to k3s') {
             steps {
-                // Non-fatal on purpose: the EKS cluster (infra/terraform)
-                // may not be provisioned yet. Build still succeeds through
-                // Nexus push even if this stage can't reach a cluster.
+                // Non-fatal on purpose: the k3s node may be stopped (cost
+                // savings) or unreachable. Build still succeeds through
+                // Nexus/ECR push even if this stage can't reach the cluster.
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                    sh '''
-                        set -e
-                        ECR_REGISTRY=$(cat .ecr_registry)
-                        aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION}
+                    withCredentials([string(credentialsId: 'k3s-kubeconfig', variable: 'K3S_KUBECONFIG_CONTENT')]) {
+                        sh '''
+                            set -e
+                            ECR_REGISTRY=$(cat .ecr_registry)
+                            KUBECONFIG_FILE="$(pwd)/.k3s-kubeconfig-${BUILD_NUMBER}.yaml"
+                            umask 077
+                            printf '%s' "$K3S_KUBECONFIG_CONTENT" > "$KUBECONFIG_FILE"
+                            export KUBECONFIG="$KUBECONFIG_FILE"
 
-                        kubectl create namespace ${HELM_NAMESPACE} \
-                            --dry-run=client -o yaml | kubectl apply -f -
+                            kubectl create namespace ${HELM_NAMESPACE} \
+                                --dry-run=client -o yaml | kubectl apply -f -
 
-                        helm upgrade --install ${HELM_RELEASE} ./helm/smartdockershrinker \
-                            --namespace ${HELM_NAMESPACE} \
-                            --set image.repository=${ECR_REGISTRY}/${IMAGE_NAME} \
-                            --set image.tag=shrunk-${BUILD_NUMBER} \
-                            --set imagePullSecrets=null \
-                            --wait --timeout 5m
-                    '''
+                            helm upgrade --install ${HELM_RELEASE} ./helm/smartdockershrinker \
+                                --namespace ${HELM_NAMESPACE} \
+                                --set image.repository=${ECR_REGISTRY}/${IMAGE_NAME} \
+                                --set image.tag=shrunk-${BUILD_NUMBER} \
+                                --set imagePullSecrets=null \
+                                --set ingress.enabled=false \
+                                --wait --timeout 5m
+
+                            rm -f "$KUBECONFIG_FILE"
+                        '''
+                    }
                 }
             }
         }
@@ -228,7 +243,7 @@ pipeline {
             sh 'docker image prune -f || true'
         }
         success {
-            echo "✅ Pipeline succeeded: image built, quality-gated, scanned, pushed to Nexus, and deployed to EKS."
+            echo "✅ Pipeline succeeded: image built, quality-gated, scanned, pushed to Nexus/ECR, and deployed to k3s."
         }
         failure {
             echo '❌ Pipeline failed — check the stage logs above.'
