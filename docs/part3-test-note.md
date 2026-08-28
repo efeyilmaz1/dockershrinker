@@ -4,3 +4,5 @@ Bu dosya, Visual Semantic Translator Bot'un (webhook + Playwright + Gemini Visio
 gercekten calistigini dogrulamak icin acilan test PR'inin bir parcasidir.
 
 locale: de-DE
+
+Canli demo tetiklemesi: webhook otomatik Job olusturuyor mu test ediliyor.
